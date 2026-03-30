@@ -15,6 +15,14 @@ using namespace esphome;
 void StreamServerComponent::setup() {
     ESP_LOGCONFIG(TAG, "Setting up stream server...");
 
+    // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
+    this->buf_ = std::unique_ptr<uint8_t[]>{new (std::nothrow) uint8_t[this->buf_size_]};
+    if (!this->buf_) {
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for ring buffer", this->buf_size_);
+        this->mark_failed();
+        return;
+    }
+
     struct sockaddr_storage bind_addr;
 #if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), this->port_);
@@ -22,34 +30,28 @@ void StreamServerComponent::setup() {
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), htons(this->port_));
 #endif
 
-    auto init = [&]() -> bool {
-        // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
-        this->buf_ = std::unique_ptr<uint8_t[]>{new (std::nothrow) uint8_t[this->buf_size_]};
-        if (!this->buf_) {
-            ESP_LOGE(TAG, "Failed to allocate %u bytes for ring buffer", this->buf_size_);
-            return false;
-        }
-        this->socket_ = socket::socket_ip(SOCK_STREAM, PF_INET);
-        if (!this->socket_) {
-            ESP_LOGE(TAG, "Could not create socket: errno %d", errno);
-            return false;
-        }
-        if (this->socket_->setblocking(false) != 0) {
-            ESP_LOGE(TAG, "Could not set socket to non-blocking mode: errno %d", errno);
-            return false;
-        }
-        if (this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen) != 0) {
-            ESP_LOGE(TAG, "Could not bind socket on port %u: errno %d", this->port_, errno);
-            return false;
-        }
-        if (this->socket_->listen(8) != 0) {
-            ESP_LOGE(TAG, "Could not start listening on socket: errno %d", errno);
-            return false;
-        }
-        return true;
-    };
+    this->socket_ = socket::socket_ip(SOCK_STREAM, PF_INET);
+    if (!this->socket_) {
+        ESP_LOGE(TAG, "Could not create socket: errno %d", errno);
+        this->mark_failed();
+        return;
+    }
 
-    if (!init()) {
+    int err;
+    if ((err = this->socket_->setblocking(false)) != 0) {
+        ESP_LOGE(TAG, "Could not set socket to non-blocking mode: errno %d", errno);
+        this->mark_failed();
+        return;
+    }
+
+    if ((err = this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen)) != 0) {
+        ESP_LOGE(TAG, "Could not bind socket on port %u: errno %d", this->port_, errno);
+        this->mark_failed();
+        return;
+    }
+
+    if ((err = this->socket_->listen(8)) != 0) {
+        ESP_LOGE(TAG, "Could not start listening on socket: errno %d", errno);
         this->mark_failed();
         return;
     }
