@@ -16,7 +16,12 @@ void StreamServerComponent::setup() {
     ESP_LOGCONFIG(TAG, "Setting up stream server...");
 
     // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
-    this->buf_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->buf_size_]};
+    this->buf_ = std::unique_ptr<uint8_t[]>{new (std::nothrow) uint8_t[this->buf_size_]};
+    if (!this->buf_) {
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for ring buffer", this->buf_size_);
+        this->mark_failed();
+        return;
+    }
 
     struct sockaddr_storage bind_addr;
 #if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
@@ -26,14 +31,37 @@ void StreamServerComponent::setup() {
 #endif
 
     this->socket_ = socket::socket_ip(SOCK_STREAM, PF_INET);
-    this->socket_->setblocking(false);
-    this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen);
-    this->socket_->listen(8);
+    if (!this->socket_) {
+        ESP_LOGE(TAG, "Could not create socket: errno %d", errno);
+        this->mark_failed();
+        return;
+    }
+
+    int err;
+    if ((err = this->socket_->setblocking(false)) != 0) {
+        ESP_LOGE(TAG, "Could not set socket to non-blocking mode: errno %d", errno);
+        this->mark_failed();
+        return;
+    }
+
+    if ((err = this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen)) != 0) {
+        ESP_LOGE(TAG, "Could not bind socket on port %u: errno %d", this->port_, errno);
+        this->mark_failed();
+        return;
+    }
+
+    if ((err = this->socket_->listen(8)) != 0) {
+        ESP_LOGE(TAG, "Could not start listening on socket: errno %d", errno);
+        this->mark_failed();
+        return;
+    }
 
     this->publish_sensor();
 }
 
 void StreamServerComponent::loop() {
+    if (this->is_failed())
+        return;
     this->accept();
     this->read();
     this->flush();
@@ -76,8 +104,11 @@ void StreamServerComponent::accept() {
     struct sockaddr_storage client_addr;
     socklen_t client_addrlen = sizeof(client_addr);
     std::unique_ptr<socket::Socket> socket = this->socket_->accept(reinterpret_cast<struct sockaddr *>(&client_addr), &client_addrlen);
-    if (!socket)
+    if (!socket) {
+        if (errno != EWOULDBLOCK && errno != EAGAIN)
+            ESP_LOGW(TAG, "Failed to accept new client: errno %d", errno);
         return;
+    }
 
     socket->setblocking(false);
 
